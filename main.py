@@ -23,8 +23,8 @@ DEFAULT_ROOM = "general"
 
 # Store client last activity timestamps for heartbeat monitoring
 client_activity = {}
-HEARTBEAT_INTERVAL = 30  # 检查客户端活动的间隔（秒）
-HEARTBEAT_TIMEOUT = 70   # 客户端超时时间（秒）
+HEARTBEAT_INTERVAL = 60  # 检查客户端活动的间隔（秒）
+HEARTBEAT_TIMEOUT = 300   # 客户端超时时间（秒）
 
 # 创建一个全局变量，用于指示心跳检查器是否已启动
 heartbeat_checker_started = False
