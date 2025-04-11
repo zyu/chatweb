@@ -245,8 +245,8 @@ if __name__ == "__main__":
     # --- SSL/TLS 配置 ---
     # 从环境变量读取证书和密钥文件路径
     # 你需要确保这些文件存在并且路径正确
-    ssl_certfile = os.getenv('SSL_CERTFILE', 'ssl.scr') # 添加默认值
-    ssl_keyfile = os.getenv('SSL_KEYFILE', 'ssl.key') # 添加默认值
+    ssl_certfile = os.getenv('SSL_CERTFILE', 'cert.pem') # 添加默认值
+    ssl_keyfile = os.getenv('SSL_KEYFILE', 'key.pem') # 添加默认值
     ssl_passphrase = os.getenv('SSL_PASSPHRASE') # 读取密码（可能为 None）
     app_options = None # 用于存放 AppOptions 实例
 
@@ -257,7 +257,7 @@ if __name__ == "__main__":
                 app_options = AppOptions(
                     key_file_name=ssl_keyfile,
                     cert_file_name=ssl_certfile,
-                    passphrase=None # 如果没有密码，传递 None 也可以
+                    passphrase=ssl_passphrase # 如果没有密码，传递 None 也可以
                 )
                 logging.info(f"找到 SSL 证书和密钥文件，将使用 AppOptions 启用 HTTPS/WSS。 Cert: {ssl_certfile}, Key: {ssl_keyfile}")
             except Exception as e:
