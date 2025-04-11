@@ -25,10 +25,6 @@ logging.basicConfig(
 # Default room name
 DEFAULT_ROOM = "general"
 
-# --- Removed Persistent User ID Mapping ---
-# client_id_to_user_id_map = {}
-# user_id_lock = threading.Lock()
-
 # Store client last activity timestamps for heartbeat monitoring
 client_activity = {}
 HEARTBEAT_INTERVAL = 60  # Check client activity interval (seconds)
@@ -150,7 +146,6 @@ async def ws_upgrade(res, req, socket_context):
         # Store necessary info in user_data
         user_data = {
             "app": app,
-            # Removed client_id
             "chat_user_id": assigned_chat_user_id, # Store the generated chat user ID
             "remote_ip": remote_ip
         }
@@ -270,7 +265,7 @@ async def ws_message(ws, message, opcode):
     message_content = None
     is_text = False
 
-    # --- Message Handling (largely unchanged, uses chat_user_id) ---
+    # --- Message Handling ---
     if opcode == OpCode.TEXT:
         try:
             if isinstance(message, bytes): message_content = message.decode("utf-8")
@@ -382,18 +377,29 @@ if __name__ == "__main__":
     port_str = os.getenv("PORT", "8011")
     try: port = int(port_str)
     except ValueError: logging.error(f"Invalid PORT: '{port_str}'. Using 8011."); port = 8011
-    host = os.getenv("HOST", "0.0.0.0")
+    host = os.getenv("HOST", "0.0.0.0") # Keep host variable for logging clarity if needed elsewhere
     logging.info(f"Attempting to start server on {host}:{port}...")
+
     def on_listen(config):
         protocol = "https" if app_options else "http"; ws_protocol = "wss" if app_options else "ws"
         actual_host = config.host if config.host != "0.0.0.0" else "127.0.0.1"; actual_port = config.port
-        if config.host == "0.0.0.0": logging.info(f"Server listening on 0.0.0.0:{actual_port}")
-        else: logging.info(f"Server listening on {config.host}:{actual_port}")
+        # Log the host the server is actually listening on (might differ from the 'host' variable if not 0.0.0.0)
+        listening_host = config.host if config.host else "all interfaces"
+        logging.info(f"Server listening on {listening_host}:{actual_port}")
+        if config.host == "0.0.0.0": logging.info(f"Access via machine's IP or '{actual_host}'")
+
         logging.info(f"Successfully started!")
         logging.info(f"  HTTP: {protocol}://{actual_host}:{actual_port}/")
-        logging.info(f"  WS:   {ws_protocol}://{actual_host}:{actual_port}/ws") # No query param needed now
-    def on_error(error): logging.error(f"Failed to listen on {host}:{port} - {error}", exc_info=True)
-    try: app.listen(port, on_listen, host=host); app.run()
-    except Exception as listen_err: on_error(listen_err)
-    logging.info("Server shutdown.")
+        logging.info(f"  WS:   {ws_protocol}://{actual_host}:{actual_port}/ws")
 
+    def on_error(error):
+        logging.error(f"Failed to listen on {host}:{port} - {error}", exc_info=True)
+
+    try:
+        # Corrected: Removed the host keyword argument
+        app.listen(port, on_listen)
+        app.run()
+    except Exception as listen_err:
+         on_error(listen_err)
+
+    logging.info("Server shutdown.")
