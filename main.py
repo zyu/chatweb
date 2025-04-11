@@ -61,42 +61,22 @@ async def ws_upgrade(res, req, socket_context):
     res.upgrade(key, protocol, extensions, socket_context, user_data)
 
 
-# --- Helper Function for Address Decoding ---
+# --- Helper Function for Address Decoding (Simplified) ---
 def decode_remote_address(ws) -> str:
-    """尝试解码 WebSocket 的远程地址"""
+    """尝试解码 WebSocket 的远程地址 (简化版)"""
     remote_address_str = "未知地址(获取失败)"
     try:
-        # 优先使用 get_remote_address() 如果它返回正确格式
+        # 只尝试 get_remote_address()
         addr_tuple = ws.get_remote_address()
-        if addr_tuple and len(addr_tuple) == 2 and isinstance(addr_tuple[0], str):
+        # 检查返回的是否是 (str, int) 格式
+        if addr_tuple and len(addr_tuple) == 2 and isinstance(addr_tuple[0], str) and isinstance(addr_tuple[1], int):
              remote_address_str = f"{addr_tuple[0]}:{addr_tuple[1]}"
+             # logging.debug(f"成功解码地址: {remote_address_str}") # Debug log if needed
              return remote_address_str # 成功获取并格式化
         else:
-             logging.debug(f"get_remote_address() 返回非预期格式: {addr_tuple}, 尝试字节解码")
-             # 回退到字节解码
-             addr_bytes_tuple = ws.get_remote_address_bytes()
-             if addr_bytes_tuple and len(addr_bytes_tuple) == 2:
-                 address_bytes = addr_bytes_tuple[0]
-                 port = addr_bytes_tuple[1]
-                 try:
-                     # 尝试按 IPv6 解码 (能处理 IPv4-mapped IPv6)
-                     ip_str = socket.inet_ntop(socket.AF_INET6, address_bytes)
-                     # 清理 IPv4-mapped IPv6 地址的前缀
-                     if ip_str.startswith("::ffff:"):
-                         ip_str = ip_str[len("::ffff:"):]
-                 except (ValueError, OSError, socket.error):
-                     try:
-                         # 如果 IPv6 解码失败，尝试按 IPv4 解码
-                         ip_str = socket.inet_ntop(socket.AF_INET, address_bytes)
-                     except (ValueError, OSError, socket.error) as e:
-                         logging.warning(f"无法将地址字节解码为 IPv6 或 IPv4: {address_bytes!r}, error: {e}")
-                         ip_str = f"无法解码({address_bytes!r})"
-
-                 remote_address_str = f"{ip_str}:{port}"
-
-             else:
-                 logging.warning(f"get_remote_address_bytes() 返回非预期格式: {addr_bytes_tuple}")
-                 remote_address_str = "未知地址(字节格式错误)"
+             # 如果格式不对，记录警告并返回默认值
+             logging.warning(f"get_remote_address() 返回非预期格式: {addr_tuple}")
+             remote_address_str = "未知地址(格式错误)"
 
     except Exception as e:
         logging.error(f"获取或解码 remote_address 时出错: {e}")
@@ -144,20 +124,23 @@ async def ws_message(ws, message, opcode):
     user_id = user_data.get("user_id")
     remote_address_str = decode_remote_address(ws) # 使用辅助函数解码
 
-    try:
-        message_str = message.decode('utf-8')
-        logging.debug(f"收到来自 {remote_address_str} ({user_id}) 的消息: {message_str}")
-    except UnicodeDecodeError:
-        logging.error(f"无法将来自 {remote_address_str} ({user_id}) 的消息解码为 UTF-8: {message!r}")
+    # *** 修改点：检查 message 是否为 str，不再调用 decode ***
+    if not isinstance(message, str):
+        logging.error(f"收到来自 {remote_address_str} ({user_id}) 的非字符串消息: 类型 {type(message)}, 内容 {message!r}")
+        # 可以选择发送错误或直接返回
         try:
             error_msg = json.dumps({
-                "type": "error", "message": "无效的消息编码 (非 UTF-8)",
+                "type": "error", "message": "服务器期望收到文本消息",
                 "timestamp": asyncio.get_event_loop().time()
             }).encode('utf-8')
             ws.send(error_msg, opcode)
         except Exception as send_err:
-             logging.error(f"向客户端 {remote_address_str} 发送编码错误消息失败: {send_err}")
+             logging.error(f"向客户端 {remote_address_str} 发送类型错误消息失败: {send_err}")
         return
+
+    # message 已经是字符串了
+    message_str = message
+    logging.debug(f"收到来自 {remote_address_str} ({user_id}) 的消息: {message_str}")
 
     try:
         data = json.loads(message_str)
@@ -166,6 +149,7 @@ async def ws_message(ws, message, opcode):
 
         if data.get('type') == 'chat' and data.get('message'):
              try:
+                 # 注意：确保发送的是字符串
                  ws.publish(DEFAULT_ROOM, json.dumps(data), False)
              except Exception as pub_err:
                  logging.error(f"Error publishing chat message from user {user_id}: {pub_err}")
@@ -199,13 +183,18 @@ async def ws_close(ws, code, message):
     else:
         logging.warning(f"连接关闭时未找到用户数据 (app/user_id), code: {code}, message: {message}, address: {remote_address_str}")
 
+    # *** 修改点：检查 message 是否为 bytes 才解码 ***
     message_str = ""
-    if message:
+    if isinstance(message, bytes): # 只有 bytes 才需要 decode
         try:
             message_str = message.decode('utf-8', errors='replace')
         except Exception as decode_err:
             logging.warning(f"Could not decode close message bytes: {message!r}, error: {decode_err}")
             message_str = "(无法解码的消息)"
+    elif isinstance(message, str): # 如果已经是 str，直接用
+         message_str = message
+    # 如果是其他类型，message_str 保持 ""
+
 
     logging.info(f"客户端断开连接: {remote_address_str} (ID: {user_id}), code: {code}, message: {message_str}")
 
@@ -217,6 +206,7 @@ async def ws_close(ws, code, message):
 
     if app:
         try:
+            # 注意：确保发送的是字符串
             app.publish(DEFAULT_ROOM, leave_message, False)
             logging.info(f"已广播用户 {user_id} 离开房间 {DEFAULT_ROOM} 的消息")
         except Exception as pub_err:
