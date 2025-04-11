@@ -309,89 +309,89 @@ async def home(res, req):
 
 
 # --- Main Application Setup and Start ---
+# --- Main Application Setup and Start ---
 if __name__ == "__main__":
 
     # --- SSL/TLS Configuration ---
+    # ... (SSL config remains the same) ...
     ssl_certfile = os.getenv('SSL_CERTFILE', 'cert.pem')
     ssl_keyfile = os.getenv('SSL_KEYFILE', 'key.pem')
     ssl_passphrase = os.getenv('SSL_PASSPHRASE')
     app_options = None
 
-    # Check if SSL files are configured and exist
     if ssl_certfile and ssl_keyfile:
         if os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile):
             try:
-                # Create AppOptions for SSL
                 app_options = AppOptions(
                     key_file_name=ssl_keyfile,
                     cert_file_name=ssl_certfile,
                     passphrase=ssl_passphrase
                 )
-                logging.info(f"找到 SSL 证书和密钥文件，将使用 AppOptions 启用 HTTPS/WSS。 Cert: {ssl_certfile}, Key: {ssl_keyfile}") # Found SSL cert/key files, enabling HTTPS/WSS with AppOptions
+                logging.info(f"找到 SSL 证书和密钥文件，将使用 AppOptions 启用 HTTPS/WSS。 Cert: {ssl_certfile}, Key: {ssl_keyfile}")
             except Exception as e:
-                 # Log error if AppOptions creation fails
-                 logging.error(f"创建 AppOptions 时出错: {e}") # Error creating AppOptions
-                 app_options = None # Fallback to HTTP/WS
+                 logging.error(f"创建 AppOptions 时出错: {e}")
+                 app_options = None
         else:
-            # Log warning if files are specified but not found
-            logging.warning(f"SSL 证书或密钥文件路径无效或文件不存在 ({ssl_certfile}, {ssl_keyfile})，将以 HTTP/WS 模式运行。") # SSL cert or key file path invalid or file not found, running in HTTP/WS mode
+            logging.warning(f"SSL 证书或密钥文件路径无效或文件不存在 ({ssl_certfile}, {ssl_keyfile})，将以 HTTP/WS 模式运行。")
     else:
-        # Log warning if SSL environment variables are not set
-        logging.warning("未配置 SSL_CERTFILE 和 SSL_KEYFILE 环境变量 (或值为空)，将以 HTTP/WS 模式运行。") # SSL_CERTFILE and SSL_KEYFILE env vars not configured, running in HTTP/WS mode
+        logging.warning("未配置 SSL_CERTFILE 和 SSL_KEYFILE 环境变量 (或值为空)，将以 HTTP/WS 模式运行。")
+
 
     # Create the Socketify App, passing AppOptions if available
     app = socketify.App(app_options)
     if app_options:
-        logging.info("Socketify App 初始化时传入了 AppOptions。") # Socketify App initialized with AppOptions
+        logging.info("Socketify App 初始化时传入了 AppOptions。")
     else:
-        logging.info("Socketify App 初始化时未传入 AppOptions (HTTP/WS 模式)。") # Socketify App initialized without AppOptions (HTTP/WS mode)
+        logging.info("Socketify App 初始化时未传入 AppOptions (HTTP/WS 模式)。")
 
-    # Store app instance globally for access in handlers (especially ws_upgrade)
-    # Consider alternatives like dependency injection if the app grows complex
     globals()['app'] = app
 
     # WebSocket configuration options
+    # ... (ws_options remains the same) ...
     ws_options = {
-        "compression": 0, # Disable compression unless needed (0 = disabled)
-        "max_payload_length": 16 * 1024, # Max message size (16KB)
-        "idle_timeout": 300, # Timeout in seconds (5 minutes)
-        "upgrade": ws_upgrade, # Handler for upgrade request
-        "open": ws_open,       # Handler for connection open
-        "message": ws_message, # Handler for incoming messages
-        "close": ws_close,     # Handler for connection close
-        # "drain": ws_drain,    # Optional: Handle backpressure
-        # "ping": ws_ping,      # Optional: Handle PING frames (usually automatic PONG)
-        # "pong": ws_pong       # Optional: Handle PONG frames
+        "compression": 0,
+        "max_payload_length": 16 * 1024,
+        "idle_timeout": 300,
+        "upgrade": ws_upgrade,
+        "open": ws_open,
+        "message": ws_message,
+        "close": ws_close,
     }
 
-    # Register WebSocket route
+
     app.ws("/ws", ws_options)
-    # Register HTTP route
     app.get("/", home)
 
     # Get host and port from environment variables or use defaults
     port = int(os.getenv('PORT', '8011'))
-    host = os.getenv('HOST', '0.0.0.0')
+    host = os.getenv('HOST', '0.0.0.0') # Host is defined but not passed directly to listen here
 
-    logging.info(f"服务器正在启动，监听地址 {host}:{port}...") # Server starting, listening on address...
+    logging.info(f"服务器正在启动，监听地址 {host}:{port}...") # Log the intended host and port
 
     # Define the callback for successful listening
     def on_listen(config):
+        # config contains the actual listening configuration (like resolved port)
         protocol = 'https' if app_options else 'http'
         ws_protocol = 'wss' if app_options else 'ws'
-        # Determine the display host address
-        display_host = config.host if config.host != '0.0.0.0' else '127.0.0.1' # Use 127.0.0.1 for display if listening on 0.0.0.0
-        if config.host == '0.0.0.0':
-             logging.info(f"服务器正在监听所有接口。请使用你的机器的实际 IP 地址或 'localhost'/'127.0.0.1' 访问。") # Server listening on all interfaces. Please use your machine's actual IP address or 'localhost'/'127.0.0.1' to access.
+        # Use the 'host' variable defined above for display URLs,
+        # especially handling '0.0.0.0' for user clarity.
+        # Use config.host to know the actual bound host if needed, but for display, 'host' is often better.
+        display_host = host if host != '0.0.0.0' else '127.0.0.1' # Use 127.0.0.1 or localhost for display if listening on 0.0.0.0
+        actual_port = config.port # Get the actual port from the config object
+
+        if host == '0.0.0.0':
+             # Add a note about listening on all interfaces
+             logging.info(f"服务器正在监听所有接口 (0.0.0.0) 上的端口 {actual_port}。") # Server listening on all interfaces...
+             logging.info(f"请使用你机器的实际 IP 地址或 'localhost'/'127.0.0.1' 访问。") # Please use your machine's actual IP address...
 
         logging.info(
             f"成功启动! " # Successfully started!
-            f"访问 {protocol}://{display_host}:{config.port} 或 " # Visit ... or ...
-            f"{ws_protocol}://{display_host}:{config.port}/ws"
+            f"访问 {protocol}://{display_host}:{actual_port} 或 " # Visit ... or ...
+            f"{ws_protocol}://{display_host}:{actual_port}/ws"
         )
 
-    # Start listening
-    app.listen(port, host, on_listen) # Pass host here
+    # *** CORRECTED LINE: Start listening - Pass only port and callback ***
+    app.listen(port, on_listen)
 
     # Run the application's event loop
     app.run()
