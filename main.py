@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import string
+import time
 from dotenv import load_dotenv
 
 # Load .env file at the start
@@ -20,11 +21,60 @@ logging.basicConfig(level=getattr(logging, log_level_name, logging.INFO),
 # Default room name
 DEFAULT_ROOM = "general"
 
+# Store client last activity timestamps for heartbeat monitoring
+client_activity = {}
+HEARTBEAT_INTERVAL = 30  # 检查客户端活动的间隔（秒）
+HEARTBEAT_TIMEOUT = 70   # 客户端超时时间（秒）
+
 # --- Helper Function ---
 def generate_random_userid(length=4):
     """Generates a random alphanumeric ID of specified length."""
     characters = string.ascii_letters + string.digits
     return ''.join(random.choice(characters) for _ in range(length))
+
+# --- Heartbeat Tracker ---
+async def heartbeat_checker():
+    """定期检查客户端活动并关闭超时的连接"""
+    while True:
+        try:
+            current_time = time.time()
+            inactive_clients = []
+            
+            # Find inactive clients
+            for ws, last_active in list(client_activity.items()):
+                if current_time - last_active > HEARTBEAT_TIMEOUT:
+                    inactive_clients.append(ws)
+            
+            # Close inactive connections
+            for ws in inactive_clients:
+                try:
+                    user_data = ws.get_user_data()
+                    user_id = user_data.get("user_id", "未知用户") if user_data else "未知用户"
+                    logging.warning(f"关闭不活跃的连接: {user_id} (超过 {HEARTBEAT_TIMEOUT}秒无活动)")
+                    
+                    # Send a warning before closing
+                    try:
+                        warning_msg = json.dumps({
+                            "type": "system",
+                            "message": "由于长时间不活动，您的连接即将关闭",
+                            "timestamp": time.time()
+                        })
+                        ws.send(warning_msg, OpCode.TEXT)
+                    except Exception:
+                        pass  # Ignore if we can't send the warning
+                    
+                    # Remove from activity tracker and close the connection
+                    if ws in client_activity:
+                        del client_activity[ws]
+                    ws.end(1000, "不活跃连接超时")
+                except Exception as e:
+                    logging.error(f"关闭不活跃连接时出错: {e}")
+            
+            # Wait for next check
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+        except Exception as e:
+            logging.error(f"心跳检查器出错: {e}")
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 # --- WebSocket Event Handlers (Async) ---
 async def ws_upgrade(res, req, socket_context):
@@ -91,6 +141,9 @@ async def ws_open(ws):
     user_id = user_data.get("user_id")
     remote_address_str = decode_remote_address(ws) # Use helper to decode
 
+    # 初始化客户端活动时间
+    client_activity[ws] = time.time()
+
     logging.info(f"客户端连接成功 (升级后): {remote_address_str} (ID: {user_id})")
 
     ws.subscribe(DEFAULT_ROOM)
@@ -101,16 +154,33 @@ async def ws_open(ws):
         welcome_message = json.dumps({
             "type": "system",
             "message": f"欢迎加入聊天室，您的 ID 是: {user_id}",
-            "timestamp": asyncio.get_event_loop().time()
+            "timestamp": time.time()
         })
         ws.send(welcome_message, OpCode.TEXT)
         logging.debug(f"已发送欢迎消息给用户 {user_id}")
     except Exception as send_err:
         logging.error(f"发送欢迎消息给用户 {user_id} 时出错: {send_err}")
 
+    # Broadcast join message to room
+    try:
+        join_message = json.dumps({
+            "type": "user_join",
+            "user": user_id,
+            "timestamp": time.time()
+        })
+        app_instance = user_data.get("app")
+        if app_instance:
+            app_instance.publish(DEFAULT_ROOM, join_message, False)
+            logging.debug(f"已广播用户 {user_id} 加入房间 {DEFAULT_ROOM} 的消息")
+    except Exception as pub_err:
+        logging.error(f"广播用户加入消息时出错: {pub_err}")
+
 
 async def ws_message(ws, message, opcode):
     """(Async) Handles received WebSocket messages."""
+    # 更新客户端活动时间
+    client_activity[ws] = time.time()
+    
     user_data = ws.get_user_data()
     if not user_data or "user_id" not in user_data:
         logging.error("User data (app/user_id) not found on WebSocket message")
@@ -142,11 +212,27 @@ async def ws_message(ws, message, opcode):
             return
     elif opcode == OpCode.BINARY:
         logging.info(f"收到来自 {remote_address_str} ({user_id}) 的二进制消息 (长度: {len(message)})")
-        return # Ignore binary messages
+        try:
+            # Try to handle binary message as UTF-8 text (for browser compatibility)
+            if isinstance(message, bytes):
+                message_content = message.decode('utf-8', errors='replace')
+                is_text = True
+                logging.debug(f"已将二进制消息解码为文本: {message_content}")
+            else:
+                logging.error(f"二进制消息类型不支持: {type(message)}")
+                return
+        except Exception as e:
+            logging.error(f"解析二进制消息时出错: {e}")
+            return
     else:
         # Handle control frames
         if opcode == OpCode.PING:
             logging.debug(f"收到来自 {user_id} 的 PING")
+            # Automatically respond to ping with pong
+            try:
+                ws.send("", OpCode.PONG)
+            except Exception as e:
+                logging.error(f"发送 PONG 响应时出错: {e}")
         elif opcode == OpCode.PONG:
             logging.debug(f"收到来自 {user_id} 的 PONG")
         elif opcode == OpCode.CLOSE:
@@ -160,9 +246,25 @@ async def ws_message(ws, message, opcode):
         try:
             data = json.loads(message_content)
             
-            # Add user ID and timestamp to the data
+            # 处理 ping 心跳消息
+            if data.get('type') == 'ping':
+                logging.debug(f"收到来自 {user_id} 的 ping 心跳")
+                try:
+                    # 发送 pong 响应
+                    pong_response = json.dumps({
+                        "type": "pong",
+                        "timestamp": time.time()
+                    })
+                    ws.send(pong_response, OpCode.TEXT)
+                    return
+                except Exception as e:
+                    logging.error(f"发送 pong 响应时出错: {e}")
+                    return
+            
+            # Add user ID and timestamp to the data (for normal messages)
             data['user'] = user_id
-            data['timestamp'] = asyncio.get_event_loop().time()
+            if 'timestamp' not in data:
+                data['timestamp'] = time.time()
 
             # Basic validation of expected chat message format
             if data.get('type') == 'chat' and 'message' in data:
@@ -186,7 +288,7 @@ async def ws_message(ws, message, opcode):
                 error_msg = json.dumps({
                     "type": "error", 
                     "message": "无效的消息格式 (非 JSON 文本)",
-                    "timestamp": asyncio.get_event_loop().time()
+                    "timestamp": time.time()
                 })
                 ws.send(error_msg, OpCode.TEXT)
             except Exception as send_err:
@@ -197,6 +299,10 @@ async def ws_message(ws, message, opcode):
 
 async def ws_close(ws, code, message):
     """(Async) Handles WebSocket connection closure."""
+    # 移除客户端活动记录
+    if ws in client_activity:
+        del client_activity[ws]
+        
     user_data = ws.get_user_data()
     user_id = "未知用户"
     app_instance = None
@@ -225,7 +331,7 @@ async def ws_close(ws, code, message):
         leave_message = json.dumps({
             "type": "user_leave",
             "user": user_id,
-            "timestamp": asyncio.get_event_loop().time()
+            "timestamp": time.time()
         })
         try:
             app_instance.publish(DEFAULT_ROOM, leave_message, False)
@@ -272,21 +378,24 @@ if __name__ == "__main__":
 
     # WebSocket configuration options with improved settings
     ws_options = {
-        "compression": 0,  # Disable compression to avoid potential issues
+        "compression": 0,  # 禁用压缩以避免潜在问题
         "max_payload_length": 16 * 1024,
-        "idle_timeout": 120,  # Reduced from 300 for faster detection of dead connections
-        "max_backpressure": 1024 * 1024,  # Set a reasonable backpressure limit
-        "reset_idle_timeout_on_send": True,  # Reset timeout on send
+        "idle_timeout": 120,  # 降低超时时间以更快检测死连接
+        "max_backpressure": 1024 * 1024,  # 设置合理的背压限制
+        "reset_idle_timeout_on_send": True,  # 发送时重置超时
         "upgrade": ws_upgrade,
         "open": ws_open,
         "message": ws_message,
         "close": ws_close,
-        "ping": None,  # Let the library handle pings automatically
-        "pong": None,  # Let the library handle pongs automatically
+        "ping": None,  # 让库自动处理 ping
+        "pong": None,  # 让库自动处理 pong
     }
 
     app.ws("/ws", ws_options)
     app.get("/", home)
+
+    # 启动心跳检查器
+    asyncio.create_task(heartbeat_checker())
 
     # Get host and port from environment variables or use defaults
     port = int(os.getenv('PORT', '8011'))
