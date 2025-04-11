@@ -1,3 +1,26 @@
+# [tool.poetry] 部分包含了 Poetry 直接使用的元数据和依赖定义
+[tool.poetry]
+name = "chart"
+version = "0.1.0"
+description = ""
+authors = ["zyuvszqk <zumwachang479@gmail.com>"]  # 注意这里的作者格式与 [project] 不同
+readme = "README.md"
+# 如果你的 Python 代码主要在名为 'chart' 的子目录中，可以取消下面这行的注释
+# packages = [{ include = "chart" }]
+
+[tool.poetry.dependencies]
+python = ">=3.12"  # Python 版本约束放在这里
+socketify = ">=0.0.31,<0.0.32"
+uvicorn = ">=0.34.0,<0.35.0"
+websockets = ">=15.0.1,<16.0.0"
+"python-dotenv" = ">=1.1.0,<2.0.0" # 带特殊字符的包名建议加引号
+
+# 如果有开发依赖，可以像下面这样添加 dev 组：
+# [tool.poetry.group.dev.dependencies]
+# pytest = "^7.0"
+
+
+# [project] 部分是 PEP 621 标准格式，现代 Poetry 可以读取它
 [project]
 name = "chart"
 version = "0.1.0"
@@ -15,6 +38,7 @@ dependencies = [
 ]
 
 
+# [build-system] 部分告诉工具如何构建项目，这里指定使用 Poetry
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
+requires = ["poetry-core>=2.0.0,<3.0.0"] # 使用你文件中已有的版本约束
 build-backend = "poetry.core.masonry.api"
