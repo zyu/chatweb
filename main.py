@@ -54,60 +54,46 @@ async def ws_upgrade(res, req, socket_context):
     res.upgrade(key, protocol, extensions, socket_context, user_data)
 
 
-# --- Helper Function for Address Decoding (More Robust) ---
+# --- Helper Function for Address Decoding (Using get_remote_address) ---
 def decode_remote_address(ws) -> str:
-    """Attempts to decode the WebSocket's remote address robustly."""
+    """Attempts to decode the WebSocket's remote address using get_remote_address()."""
     remote_address_str = "未知地址(获取失败)" # Unknown address (fetch failed)
     try:
-        # ws.get_remote_address() returns a tuple (address_bytes, port)
-        # address_bytes is typically IPv6 (16 bytes) or IPv4 (4 bytes)
-        addr_tuple = ws.get_remote_address_bytes() # Use _bytes version
+        # Use get_remote_address() which should return (str, int)
+        addr_tuple = ws.get_remote_address()
 
         if addr_tuple and isinstance(addr_tuple, tuple) and len(addr_tuple) == 2:
-            address_bytes, port = addr_tuple
+            ip_str, port = addr_tuple
 
-            # Handle None or empty address bytes
-            if not address_bytes:
-                 logging.warning("get_remote_address_bytes() returned empty address bytes.")
-                 return f"未知地址(空字节):{port}" # Unknown address (empty bytes)
-
-            # Attempt to decode common formats
-            try:
-                # Check for IPv4-mapped IPv6 ::ffff:x.x.x.x
-                if len(address_bytes) == 16 and address_bytes.startswith(b'\x00'*10 + b'\xff\xff'):
-                    ipv4_bytes = address_bytes[12:]
-                    # Convert 4 bytes to standard IPv4 string
-                    ip_str = ".".join(map(str, ipv4_bytes))
-                    remote_address_str = f"{ip_str}:{port}"
-                # Check for standard IPv4
-                elif len(address_bytes) == 4:
-                    ip_str = ".".join(map(str, address_bytes))
-                    remote_address_str = f"{ip_str}:{port}"
-                # Check for standard IPv6 (basic representation)
-                elif len(address_bytes) == 16:
-                    # This provides a hex representation, not the standard compressed IPv6 format
-                    # For a full IPv6 format, socket.inet_ntop(socket.AF_INET6, address_bytes) could be used
-                    # but requires the socket module and adds complexity. Logging hex is often sufficient.
-                    ip_str = address_bytes.hex()
-                    remote_address_str = f"[{ip_str}]:{port}" # Use [] for IPv6 per convention
+            # Check if the returned value is actually (str, int)
+            if isinstance(ip_str, str) and isinstance(port, int):
+                # Handle IPv4-mapped IPv6 string format "::ffff:xxx.xxx.xxx.xxx"
+                if ip_str.startswith("::ffff:"):
+                    ipv4_part = ip_str.split(":")[-1]
+                    # Basic validation for IPv4 format
+                    if all(0 <= int(part) <= 255 for part in ipv4_part.split('.') if part.isdigit()):
+                         remote_address_str = f"{ipv4_part}:{port}"
+                    else:
+                         logging.warning(f"解析出的 IPv4 部分格式无效: {ipv4_part}") # Parsed IPv4 part format invalid
+                         remote_address_str = f"未知地址(IPv4解析错误):{port}" # Unknown address (IPv4 parse error)
                 else:
-                    logging.warning(f"get_remote_address_bytes() returned unexpected address bytes length: {len(address_bytes)}")
-                    remote_address_str = f"未知地址(格式错误):{port}" # Unknown address (format error)
-
-            except Exception as decode_e:
-                 logging.error(f"Error decoding address bytes {address_bytes!r}: {decode_e}")
-                 remote_address_str = f"未知地址(解码错误):{port}" # Unknown address (decode error)
+                    # Assume other formats (like standard IPv4 or IPv6) are okay as strings
+                    remote_address_str = f"{ip_str}:{port}"
+            else:
+                # Log if the tuple doesn't contain (str, int)
+                logging.warning(f"get_remote_address() 返回的元组类型不匹配: ({type(ip_str)}, {type(port)})") # Tuple types returned by get_remote_address() do not match
+                remote_address_str = f"未知地址(类型错误):{addr_tuple[1] if len(addr_tuple) > 1 else 'N/A'}" # Unknown address (type error)
 
         elif addr_tuple is None:
-             logging.warning("get_remote_address_bytes() returned None.")
+             logging.warning("get_remote_address() returned None.")
              remote_address_str = "未知地址(返回None)" # Unknown address (returned None)
         else:
-             # Log the unexpected format
-             logging.warning(f"get_remote_address_bytes() 返回非预期格式: {addr_tuple}") # Returned unexpected format
+             # Log the unexpected format if it's not a 2-element tuple
+             logging.warning(f"get_remote_address() 返回非预期格式: {addr_tuple}") # Returned unexpected format
              remote_address_str = "未知地址(格式错误)" # Unknown address (format error)
 
     except Exception as e:
-        # Catch potential errors from ws.get_remote_address_bytes() itself
+        # Catch potential errors from ws.get_remote_address() itself or during processing
         logging.error(f"获取或解码 remote_address 时出错: {e}") # Error getting or decoding remote_address
         # Keep the initial "未知地址(获取失败)"
 
@@ -130,29 +116,23 @@ async def ws_open(ws):
     ws.subscribe(DEFAULT_ROOM)
     logging.info(f"用户 {user_id} 加入房间: {DEFAULT_ROOM}") # User joined room
 
+    # --- Temporarily disable broadcasting join message ---
     # Prepare the join message
-    join_message = json.dumps({
-        "type": "user_join",
-        "user": user_id,
-        "timestamp": asyncio.get_event_loop().time()
-    })
-
-    # Broadcast the join message to the room
-    # NOTE: The frontend also adds a local "join" message. Decide if you want both.
-    # If this is enabled, everyone in the room (including the new user) gets notified.
-    try:
-        # Use app instance from user_data to publish globally to the room
-        app_instance = user_data.get("app")
-        if app_instance:
-             app_instance.publish(DEFAULT_ROOM, join_message, False) # False = don't exclude self
-             logging.info(f"已广播用户 {user_id} 加入房间 {DEFAULT_ROOM} 的消息 (From ws_open)") # Broadcasted user join message for room
-        else:
-             logging.error(f"无法在 ws_open 中获取 app 实例来广播用户 {user_id} 加入的消息") # Could not get app instance in ws_open to broadcast user join message
-    except Exception as pub_err:
-        logging.error(f"广播用户 {user_id} 加入房间 {DEFAULT_ROOM} 消息时出错: {pub_err}") # Error broadcasting user join message for room
-
-    # Original logging indicating skipping (can be removed if broadcasting is enabled)
-    # logging.info(f"ws_open: 跳过立即发布用户 {user_id} 加入的消息 (用于测试)") # Skipping immediate publish of user join message (for testing)
+    # join_message = json.dumps({
+    #     "type": "user_join",
+    #     "user": user_id,
+    #     "timestamp": asyncio.get_event_loop().time()
+    # })
+    # try:
+    #     app_instance = user_data.get("app")
+    #     if app_instance:
+    #          app_instance.publish(DEFAULT_ROOM, join_message, False)
+    #          logging.info(f"已广播用户 {user_id} 加入房间 {DEFAULT_ROOM} 的消息 (From ws_open)")
+    #     else:
+    #          logging.error(f"无法在 ws_open 中获取 app 实例来广播用户 {user_id} 加入的消息")
+    # except Exception as pub_err:
+    #     logging.error(f"广播用户 {user_id} 加入房间 {DEFAULT_ROOM} 消息时出错: {pub_err}")
+    logging.info(f"ws_open: 跳过广播用户 {user_id} 加入的消息 (调试 1002 错误)") # Skipping broadcast of user join message (debugging 1002 error)
 
 
 async def ws_message(ws, message, opcode):
@@ -170,41 +150,29 @@ async def ws_message(ws, message, opcode):
     is_text = False
 
     if opcode == OpCode.TEXT:
-        # Message should be string
         if isinstance(message, str):
             message_content = message
             is_text = True
             logging.debug(f"收到来自 {remote_address_str} ({user_id}) 的文本消息: {message_content}") # Received text message from
         else:
-            # This case should ideally not happen if opcode is TEXT, but handle defensively
             logging.error(f"收到来自 {remote_address_str} ({user_id}) 的消息，OpCode 是 TEXT 但类型不是 str: {type(message)}") # Received message, OpCode is TEXT but type is not str
             try:
-                # Try decoding if it looks like bytes
                 message_content = message.decode('utf-8', errors='replace')
                 is_text = True
                 logging.warning(f"尝试将非 str 文本消息解码为: {message_content}") # Attempted to decode non-str text message to
             except Exception:
                  logging.error(f"无法解码标记为 TEXT 的非 str 消息: {message!r}") # Could not decode non-str message marked as TEXT
-                 # Optionally send an error back to the client
                  return
     elif opcode == OpCode.BINARY:
-        # Handle binary message - currently just logging it
         logging.info(f"收到来自 {remote_address_str} ({user_id}) 的二进制消息 (长度: {len(message)})") # Received binary message from (length: ...)
-        # Decide how to handle binary data (e.g., ignore, process, forward)
-        # For a simple chat, we might ignore or reject binary messages
-        # message_content = message # Keep as bytes if needed
-        return # Ignore binary messages for now in this chat example
+        return # Ignore binary messages
     elif opcode == OpCode.PING:
-        # socketify handles PONG automatically, but you can log if needed
         logging.debug(f"收到来自 {remote_address_str} ({user_id}) 的 PING") # Received PING from
-        # ws.send Pong is handled by the library
         return
     elif opcode == OpCode.PONG:
         logging.debug(f"收到来自 {remote_address_str} ({user_id}) 的 PONG") # Received PONG from
-        # Handle PONG if you have custom keepalive logic
         return
     elif opcode == OpCode.CLOSE:
-         # Close frame is handled by ws_close, shouldn't arrive here typically
          logging.warning(f"收到来自 {remote_address_str} ({user_id}) 的 CLOSE OpCode 在 ws_message 中") # Received CLOSE OpCode in ws_message from
          return
     else:
@@ -220,12 +188,9 @@ async def ws_message(ws, message, opcode):
 
             # Basic validation of expected chat message format (from client)
             if data.get('type') == 'chat' and 'message' in data:
-                # Get app instance to publish globally
                 app_instance = user_data.get("app")
                 if app_instance:
                     try:
-                        # Publish the message to the room
-                        # Ensure data is dumped back to JSON string for publishing
                         app_instance.publish(DEFAULT_ROOM, json.dumps(data), False) # Publish as text
                         logging.debug(f"广播来自 {user_id} 的聊天消息到房间 {DEFAULT_ROOM}") # Broadcasting chat message from user to room
                     except Exception as pub_err:
@@ -238,7 +203,6 @@ async def ws_message(ws, message, opcode):
         except json.JSONDecodeError:
             logging.error(f"无法解析来自 {remote_address_str} ({user_id}) 的 JSON 消息: {message_content}") # Cannot parse JSON message from
             try:
-                # Send error back to the specific client
                 error_msg = json.dumps({
                     "type": "error", "message": "无效的消息格式 (非 JSON 文本)", # Invalid message format (non-JSON text)
                     "timestamp": asyncio.get_event_loop().time()
@@ -254,19 +218,17 @@ async def ws_close(ws, code, message):
     """(Async) Handles WebSocket connection closure."""
     user_data = ws.get_user_data()
     user_id = "未知用户" # Unknown user
-    app_instance = None # Use a different name to avoid confusion with global 'app'
+    app_instance = None
     remote_address_str = decode_remote_address(ws) # Use helper to decode
 
     if user_data:
         user_id = user_data.get("user_id", "未知用户(获取失败)") # Unknown user (fetch failed)
-        app_instance = user_data.get("app") # Get the app instance stored during upgrade
+        app_instance = user_data.get("app")
     else:
-        # This might happen if the connection closes before ws_open completes or fails early
         logging.warning(f"连接关闭时未找到用户数据 (app/user_id), code: {code}, address: {remote_address_str}") # User data not found on connection close
 
-    # Decode the close message if it exists and is bytes
     message_str = ""
-    if message: # Check if message is not None
+    if message:
         if isinstance(message, bytes):
             try:
                 message_str = message.decode('utf-8', errors='replace')
@@ -282,20 +244,15 @@ async def ws_close(ws, code, message):
 
     # Only broadcast leave message if user_id is known and app_instance is available
     if user_id != "未知用户" and user_id != "未知用户(获取失败)" and app_instance:
-        # Prepare leave message
         leave_message = json.dumps({
             "type": "user_leave",
             "user": user_id,
             "timestamp": asyncio.get_event_loop().time()
         })
-
-        # Publish leave message using the app instance stored in user_data
         try:
-            # Publish as text
             app_instance.publish(DEFAULT_ROOM, leave_message, False)
             logging.info(f"已广播用户 {user_id} 离开房间 {DEFAULT_ROOM} 的消息") # Broadcasted user leave message for room
         except Exception as pub_err:
-            # Log error if publishing fails
             logging.error(f"尝试在 ws_close 中广播用户 {user_id} 离开消息时出错: {pub_err}") # Error broadcasting user leave message in ws_close
     elif not app_instance and user_id != "未知用户":
          logging.error(f"无法在 ws_close 中获取 app 实例来广播用户 {user_id} 离开的消息") # Could not get app instance in ws_close to broadcast user leave message
@@ -309,11 +266,9 @@ async def home(res, req):
 
 
 # --- Main Application Setup and Start ---
-# --- Main Application Setup and Start ---
 if __name__ == "__main__":
 
     # --- SSL/TLS Configuration ---
-    # ... (SSL config remains the same) ...
     ssl_certfile = os.getenv('SSL_CERTFILE', 'cert.pem')
     ssl_keyfile = os.getenv('SSL_KEYFILE', 'key.pem')
     ssl_passphrase = os.getenv('SSL_PASSPHRASE')
@@ -347,7 +302,6 @@ if __name__ == "__main__":
     globals()['app'] = app
 
     # WebSocket configuration options
-    # ... (ws_options remains the same) ...
     ws_options = {
         "compression": 0,
         "max_payload_length": 16 * 1024,
@@ -364,23 +318,18 @@ if __name__ == "__main__":
 
     # Get host and port from environment variables or use defaults
     port = int(os.getenv('PORT', '8011'))
-    host = os.getenv('HOST', '0.0.0.0') # Host is defined but not passed directly to listen here
+    host = os.getenv('HOST', '0.0.0.0')
 
     logging.info(f"服务器正在启动，监听地址 {host}:{port}...") # Log the intended host and port
 
     # Define the callback for successful listening
     def on_listen(config):
-        # config contains the actual listening configuration (like resolved port)
         protocol = 'https' if app_options else 'http'
         ws_protocol = 'wss' if app_options else 'ws'
-        # Use the 'host' variable defined above for display URLs,
-        # especially handling '0.0.0.0' for user clarity.
-        # Use config.host to know the actual bound host if needed, but for display, 'host' is often better.
-        display_host = host if host != '0.0.0.0' else '127.0.0.1' # Use 127.0.0.1 or localhost for display if listening on 0.0.0.0
-        actual_port = config.port # Get the actual port from the config object
+        display_host = host if host != '0.0.0.0' else '127.0.0.1'
+        actual_port = config.port
 
         if host == '0.0.0.0':
-             # Add a note about listening on all interfaces
              logging.info(f"服务器正在监听所有接口 (0.0.0.0) 上的端口 {actual_port}。") # Server listening on all interfaces...
              logging.info(f"请使用你机器的实际 IP 地址或 'localhost'/'127.0.0.1' 访问。") # Please use your machine's actual IP address...
 
@@ -390,7 +339,7 @@ if __name__ == "__main__":
             f"{ws_protocol}://{display_host}:{actual_port}/ws"
         )
 
-    # *** CORRECTED LINE: Start listening - Pass only port and callback ***
+    # Start listening - Pass only port and callback
     app.listen(port, on_listen)
 
     # Run the application's event loop
