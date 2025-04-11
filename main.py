@@ -26,6 +26,9 @@ client_activity = {}
 HEARTBEAT_INTERVAL = 30  # 检查客户端活动的间隔（秒）
 HEARTBEAT_TIMEOUT = 70   # 客户端超时时间（秒）
 
+# 创建一个全局变量，用于指示心跳检查器是否已启动
+heartbeat_checker_started = False
+
 # --- Helper Function ---
 def generate_random_userid(length=4):
     """Generates a random alphanumeric ID of specified length."""
@@ -35,6 +38,7 @@ def generate_random_userid(length=4):
 # --- Heartbeat Tracker ---
 async def heartbeat_checker():
     """定期检查客户端活动并关闭超时的连接"""
+    logging.info("心跳检查器已启动")
     while True:
         try:
             current_time = time.time()
@@ -75,6 +79,36 @@ async def heartbeat_checker():
         except Exception as e:
             logging.error(f"心跳检查器出错: {e}")
             await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+# 启动心跳检查器的函数
+def start_heartbeat_checker():
+    global heartbeat_checker_started
+    
+    if heartbeat_checker_started:
+        logging.info("心跳检查器已经在运行中")
+        return
+    
+    # 创建一个新的事件循环用于心跳检查
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # 将心跳检查器作为一个任务启动
+    loop.create_task(heartbeat_checker())
+    
+    # 在一个单独的线程中运行事件循环
+    import threading
+    def run_event_loop():
+        try:
+            loop.run_forever()
+        except Exception as e:
+            logging.error(f"心跳检查器事件循环出错: {e}")
+        finally:
+            loop.close()
+    
+    heartbeat_thread = threading.Thread(target=run_event_loop, daemon=True)
+    heartbeat_thread.start()
+    heartbeat_checker_started = True
+    logging.info("心跳检查器线程已启动")
 
 # --- WebSocket Event Handlers (Async) ---
 async def ws_upgrade(res, req, socket_context):
@@ -394,8 +428,8 @@ if __name__ == "__main__":
     app.ws("/ws", ws_options)
     app.get("/", home)
 
-    # 启动心跳检查器
-    asyncio.create_task(heartbeat_checker())
+    # 启动心跳检查器 (以线程方式运行，而不是使用 asyncio.create_task)
+    start_heartbeat_checker()
 
     # Get host and port from environment variables or use defaults
     port = int(os.getenv('PORT', '8011'))
