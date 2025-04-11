@@ -382,13 +382,17 @@ if __name__ == "__main__":
 
     def on_listen(config):
         protocol = "https" if app_options else "http"; ws_protocol = "wss" if app_options else "ws"
-        actual_host = config.host if config.host != "0.0.0.0" else "127.0.0.1"; actual_port = config.port
-        # Log the host the server is actually listening on (might differ from the 'host' variable if not 0.0.0.0)
-        listening_host = config.host if config.host else "all interfaces"
+        # Corrected logic for displaying the host
+        actual_host = "127.0.0.1" if not config.host or config.host == "0.0.0.0" else config.host
+        actual_port = config.port
+        listening_host = config.host if config.host else "all interfaces" # Get the actual listening host for logging
+
         logging.info(f"Server listening on {listening_host}:{actual_port}")
-        if config.host == "0.0.0.0": logging.info(f"Access via machine's IP or '{actual_host}'")
+        if not config.host or config.host == "0.0.0.0":
+             logging.info(f"Access via machine's IP or '{actual_host}'") # Use 127.0.0.1 for display if listening on all
 
         logging.info(f"Successfully started!")
+        # Use the corrected actual_host for display URLs
         logging.info(f"  HTTP: {protocol}://{actual_host}:{actual_port}/")
         logging.info(f"  WS:   {ws_protocol}://{actual_host}:{actual_port}/ws")
 
