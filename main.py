@@ -8,454 +8,392 @@ import os
 import random
 import string
 import time
+import threading
+# Removed uuid import as it's no longer needed
 from dotenv import load_dotenv
 
 # Load .env file at the start
 load_dotenv()
 
 # Configure logging
-log_level_name = os.getenv('LOG_LEVEL', 'INFO').upper()
-logging.basicConfig(level=getattr(logging, log_level_name, logging.INFO),
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level_name, logging.INFO),
+    format="%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s",
+)
 
 # Default room name
 DEFAULT_ROOM = "general"
 
+# --- Removed Persistent User ID Mapping ---
+# client_id_to_user_id_map = {}
+# user_id_lock = threading.Lock()
+
 # Store client last activity timestamps for heartbeat monitoring
 client_activity = {}
-HEARTBEAT_INTERVAL = 60  # 检查客户端活动的间隔（秒）
-HEARTBEAT_TIMEOUT = 300   # 客户端超时时间（秒）
+HEARTBEAT_INTERVAL = 60  # Check client activity interval (seconds)
+HEARTBEAT_TIMEOUT = 300  # Client timeout duration (seconds)
 
-# 创建一个全局变量，用于指示心跳检查器是否已启动
+# Global variable to indicate if the heartbeat checker has started
 heartbeat_checker_started = False
+heartbeat_thread = None # Keep track of the thread
+
 
 # --- Helper Function ---
 def generate_random_userid(length=4):
     """Generates a random alphanumeric ID of specified length."""
     characters = string.ascii_letters + string.digits
-    return ''.join(random.choice(characters) for _ in range(length))
+    return "".join(random.choice(characters) for _ in range(length))
+
 
 # --- Heartbeat Tracker ---
 async def heartbeat_checker():
-    """定期检查客户端活动并关闭超时的连接"""
-    logging.info("心跳检查器已启动")
+    """Periodically checks client activity and closes timed-out connections."""
+    logging.info("Heartbeat checker task started.")
     while True:
         try:
             current_time = time.time()
             inactive_clients = []
-            
-            # Find inactive clients
-            for ws, last_active in list(client_activity.items()):
+            try:
+                 clients_to_check = list(client_activity.items())
+            except RuntimeError:
+                 logging.warning("Heartbeat: Could not iterate client_activity. Skipping cycle.")
+                 await asyncio.sleep(HEARTBEAT_INTERVAL)
+                 continue
+
+            for ws, last_active in clients_to_check:
+                if ws not in client_activity: continue
                 if current_time - last_active > HEARTBEAT_TIMEOUT:
                     inactive_clients.append(ws)
-            
-            # Close inactive connections
-            for ws in inactive_clients:
-                try:
-                    user_data = ws.get_user_data()
-                    user_id = user_data.get("user_id", "未知用户") if user_data else "未知用户"
-                    logging.warning(f"关闭不活跃的连接: {user_id} (超过 {HEARTBEAT_TIMEOUT}秒无活动)")
-                    
-                    # Send a warning before closing
-                    try:
-                        warning_msg = json.dumps({
-                            "type": "system",
-                            "message": "由于长时间不活动，您的连接即将关闭",
-                            "timestamp": time.time()
-                        })
-                        ws.send(warning_msg, OpCode.TEXT)
-                    except Exception:
-                        pass  # Ignore if we can't send the warning
-                    
-                    # Remove from activity tracker and close the connection
-                    if ws in client_activity:
-                        del client_activity[ws]
-                    ws.end(1000, "不活跃连接超时")
-                except Exception as e:
-                    logging.error(f"关闭不活跃连接时出错: {e}")
-            
-            # Wait for next check
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-        except Exception as e:
-            logging.error(f"心跳检查器出错: {e}")
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-# 启动心跳检查器的函数
-def start_heartbeat_checker():
-    global heartbeat_checker_started
-    
-    if heartbeat_checker_started:
-        logging.info("心跳检查器已经在运行中")
-        return
-    
-    # 创建一个新的事件循环用于心跳检查
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # 将心跳检查器作为一个任务启动
-    loop.create_task(heartbeat_checker())
-    
-    # 在一个单独的线程中运行事件循环
-    import threading
-    def run_event_loop():
-        try:
-            loop.run_forever()
+            for ws in inactive_clients:
+                if ws in client_activity and (time.time() - client_activity.get(ws, 0) > HEARTBEAT_TIMEOUT):
+                    try:
+                        user_data = ws.get_user_data()
+                        # Use chat_user_id stored in user_data for this connection
+                        user_id = user_data.get("chat_user_id", "Unknown") if user_data else "Unknown"
+                        logging.warning(f"Closing inactive connection: {user_id} (> {HEARTBEAT_TIMEOUT}s)")
+
+                        try:
+                            warning_msg = json.dumps({"type": "system", "message": "连接因不活动即将关闭", "timestamp": time.time()})
+                            ws.send(warning_msg, OpCode.TEXT)
+                        except Exception as send_warn_err:
+                            logging.debug(f"Could not send inactivity warning to {user_id}: {send_warn_err}")
+
+                        logging.debug(f"Removing {user_id} from activity tracker.")
+                        client_activity.pop(ws, None)
+                        logging.debug(f"Calling ws.end() for inactive client {user_id}")
+                        ws.end(1000, "Inactive connection timeout")
+
+                    except Exception as e:
+                        logging.error(f"Error closing inactive connection for a client ({user_id}): {e}")
+                        client_activity.pop(ws, None)
+
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+        except asyncio.CancelledError:
+            logging.info("Heartbeat checker task cancelled.")
+            break
         except Exception as e:
-            logging.error(f"心跳检查器事件循环出错: {e}")
+            logging.error(f"Heartbeat checker error: {e}", exc_info=True)
+            await asyncio.sleep(HEARTBEAT_INTERVAL) # Avoid busy-looping
+
+
+# Function to start the heartbeat checker (remains the same)
+def start_heartbeat_checker():
+    global heartbeat_checker_started, heartbeat_thread
+    if heartbeat_checker_started and heartbeat_thread and heartbeat_thread.is_alive():
+        logging.info("Heartbeat checker is already running.")
+        return
+    loop = asyncio.new_event_loop()
+    def run_event_loop():
+        logging.info(f"Heartbeat checker thread ({threading.current_thread().name}) starting event loop.")
+        asyncio.set_event_loop(loop)
+        try:
+            checker_task = loop.create_task(heartbeat_checker())
+            loop.run_until_complete(checker_task)
+        except Exception as e:
+            logging.error(f"Heartbeat checker event loop error: {e}", exc_info=True)
         finally:
+            logging.info("Closing heartbeat checker event loop.")
             loop.close()
-    
-    heartbeat_thread = threading.Thread(target=run_event_loop, daemon=True)
+    heartbeat_thread = threading.Thread(target=run_event_loop, name="HeartbeatCheckerThread", daemon=True)
     heartbeat_thread.start()
     heartbeat_checker_started = True
-    logging.info("心跳检查器线程已启动")
+    logging.info("Heartbeat checker thread started.")
+
 
 # --- WebSocket Event Handlers (Async) ---
 async def ws_upgrade(res, req, socket_context):
-    """(Async) Handles WebSocket upgrade requests."""
-    global app # Ensure app is accessible
-    if 'app' not in globals():
-         logging.error("App instance not found in global scope during upgrade")
-         res.write_status(500).end("Internal Server Error")
-         return
+    """(Async) Handles WebSocket upgrade requests, generating a random user ID."""
+    global app
+    if "app" not in globals() or app is None:
+        logging.error("App instance not found during upgrade")
+        res.write_status(500).end("Internal Server Error")
+        return
 
-    key = req.get_header("sec-websocket-key")
-    protocol = req.get_header("sec-websocket-protocol")
-    extensions = req.get_header("sec-websocket-extensions")
-
-    # Generate random user_id during upgrade
-    user_id = generate_random_userid(4)
-    logging.info(f"为新连接生成 User ID: {user_id}")
-
-    # Store app instance and generated user_id in user_data
-    user_data = {
-        "app": app,
-        "user_id": user_id
-    }
-
-    # Perform upgrade and pass user_data to the connection
-    res.upgrade(key, protocol, extensions, socket_context, user_data)
-
-
-# --- Improved Remote Address Handling ---
-def decode_remote_address(ws) -> str:
-    """Decodes the WebSocket's remote address."""
-    remote_address_str = "未知地址(获取失败)" # Unknown address (fetch failed)
     try:
-        # Try to get the remote address
-        addr = ws.get_remote_address()
-        
-        # Check if addr is a string (which appears to be the case in your environment)
-        if isinstance(addr, str):
-            # It's already a string representation
-            remote_address_str = addr
-        elif isinstance(addr, tuple) and len(addr) == 2:
-            # It's a (host, port) tuple as originally expected
-            ip_str, port = addr
-            remote_address_str = f"{ip_str}:{port}"
+        # --- Always generate a new random user ID ---
+        assigned_chat_user_id = generate_random_userid()
+        logging.info(f"Generated new user ID {assigned_chat_user_id} for incoming connection.")
+
+        # --- Proceed with Upgrade ---
+        key = req.get_header("sec-websocket-key")
+        protocol = req.get_header("sec-websocket-protocol")
+        extensions = req.get_header("sec-websocket-extensions")
+        remote_ip = "Unknown"
+        try:
+             remote_ip = req.get_remote_address_bytes().decode('utf-8', errors='replace')
+        except Exception:
+             logging.warning("Could not get remote IP during upgrade.")
+
+
+        # Store necessary info in user_data
+        user_data = {
+            "app": app,
+            # Removed client_id
+            "chat_user_id": assigned_chat_user_id, # Store the generated chat user ID
+            "remote_ip": remote_ip
+        }
+
+        # Perform upgrade
+        res.upgrade(key, protocol, extensions, socket_context, user_data)
+        logging.debug(f"WebSocket upgrade successful for userId {assigned_chat_user_id}")
+
+    except Exception as upgrade_err:
+         logging.error(f"WebSocket upgrade failed: {upgrade_err}", exc_info=True)
+         try: res.write_status(500).end("Upgrade Error")
+         except: pass
+
+
+# --- Improved Remote Address Handling (remains the same) ---
+def decode_remote_address(ws) -> str:
+    remote_address_str = "Unknown Address"
+    try:
+        addr_bytes = ws.get_remote_address_bytes()
+        if addr_bytes: remote_address_str = addr_bytes.decode('utf-8', errors='replace')
         else:
-            # For any other format, just convert to string representation
-            remote_address_str = str(addr)
-            
+            user_data = ws.get_user_data()
+            if user_data and "remote_ip" in user_data: remote_address_str = user_data["remote_ip"] + " (from upgrade)"
+            else: remote_address_str = "Unknown Address (fetch failed)"
     except Exception as e:
-        logging.error(f"获取或解码 remote_address 时出错: {e}")
-        
+        logging.error(f"Error getting/decoding remote_address: {e}")
+        user_data = ws.get_user_data()
+        if user_data and "remote_ip" in user_data: remote_address_str = user_data["remote_ip"] + " (from upgrade fallback)"
     return remote_address_str
 
 
 # --- WebSocket Handlers using the helper ---
 async def ws_open(ws):
-    """(Async) Handles new WebSocket connection (called after successful upgrade)."""
-    user_data = ws.get_user_data()
-    if not user_data or "user_id" not in user_data:
-        logging.error("User data (app/user_id) not found on WebSocket open")
-        ws.close() # Close connection if essential data is missing
-        return
-
-    user_id = user_data.get("user_id")
-    remote_address_str = decode_remote_address(ws) # Use helper to decode
-
-    # 初始化客户端活动时间
-    client_activity[ws] = time.time()
-
-    logging.info(f"客户端连接成功 (升级后): {remote_address_str} (ID: {user_id})")
-
-    ws.subscribe(DEFAULT_ROOM)
-    logging.info(f"用户 {user_id} 加入房间: {DEFAULT_ROOM}")
-
-    # Send a welcome message to just this user
+    """(Async) Handles new WebSocket connection."""
+    user_data = None
+    chat_user_id = "Unknown(Pre-Data)"
+    remote_address_str = "Unknown(Pre-Decode)"
     try:
-        welcome_message = json.dumps({
-            "type": "system",
-            "message": f"欢迎加入聊天室，您的 ID 是: {user_id}",
-            "timestamp": time.time()
-        })
-        ws.send(welcome_message, OpCode.TEXT)
-        logging.debug(f"已发送欢迎消息给用户 {user_id}")
-    except Exception as send_err:
-        logging.error(f"发送欢迎消息给用户 {user_id} 时出错: {send_err}")
+        user_data = ws.get_user_data()
+        if not user_data or "chat_user_id" not in user_data or "app" not in user_data:
+            logging.error("User data (app/chat_user_id) missing in ws_open. Closing connection.")
+            ws.close()
+            return
 
-    # Broadcast join message to room
-    try:
-        join_message = json.dumps({
-            "type": "user_join",
-            "user": user_id,
-            "timestamp": time.time()
-        })
+        chat_user_id = user_data.get("chat_user_id")
         app_instance = user_data.get("app")
-        if app_instance:
-            app_instance.publish(DEFAULT_ROOM, join_message, False)
-            logging.debug(f"已广播用户 {user_id} 加入房间 {DEFAULT_ROOM} 的消息")
-    except Exception as pub_err:
-        logging.error(f"广播用户加入消息时出错: {pub_err}")
+        remote_address_str = decode_remote_address(ws)
+
+        logging.info(f"ws_open: Connection opened for user {chat_user_id} from {remote_address_str}")
+
+        client_activity[ws] = time.time()
+        logging.debug(f"ws_open: Added user {chat_user_id} to activity tracker.")
+
+        logging.debug(f"ws_open: Subscribing user {chat_user_id} to room '{DEFAULT_ROOM}'...")
+        ws.subscribe(DEFAULT_ROOM)
+        logging.info(f"ws_open: User {chat_user_id} joined room '{DEFAULT_ROOM}'")
+
+        # --- Send welcome message with the generated ID ---
+        try:
+            logging.debug(f"ws_open: Preparing welcome message for user {chat_user_id}...")
+            welcome_message = json.dumps(
+                {
+                    "type": "system",
+                    "message": f"欢迎, 你的用户ID是: {chat_user_id}", # Standard welcome
+                    "user_id": chat_user_id, # Send the generated chat user ID
+                    "timestamp": time.time(),
+                }
+            )
+            logging.debug(f"ws_open: Sending welcome message to user {chat_user_id}...")
+            ws.send(welcome_message, OpCode.TEXT)
+            logging.info(f"ws_open: Sent welcome message to user {chat_user_id}")
+        except Exception as send_err:
+            logging.error(f"ws_open: Error sending welcome message to user {chat_user_id}: {send_err}", exc_info=True)
+
+        # --- Broadcast join message ---
+        try:
+            logging.debug(f"ws_open: Preparing join broadcast for user {chat_user_id}...")
+            join_message = json.dumps(
+                {"type": "user_join", "user": chat_user_id, "timestamp": time.time()}
+            )
+            if app_instance:
+                logging.debug(f"ws_open: Publishing join message for user {chat_user_id} to '{DEFAULT_ROOM}'...")
+                app_instance.publish(DEFAULT_ROOM, join_message, OpCode.TEXT)
+                logging.info(f"ws_open: Broadcasted join message for user {chat_user_id} to room '{DEFAULT_ROOM}'.")
+            else:
+                 logging.error("ws_open: app_instance not found, cannot broadcast join message.")
+        except Exception as pub_err:
+            logging.error(f"ws_open: Error broadcasting join message for user {chat_user_id}: {pub_err}", exc_info=True)
+
+        logging.info(f"ws_open: Handler finished successfully for user {chat_user_id}")
+
+    except Exception as open_err:
+        logging.error(f"ws_open: Critical error during connection open for user {chat_user_id}: {open_err}", exc_info=True)
+        client_activity.pop(ws, None)
+        try: ws.close()
+        except Exception as close_err: logging.error(f"ws_open: Error closing connection after open error: {close_err}")
 
 
 async def ws_message(ws, message, opcode):
     """(Async) Handles received WebSocket messages."""
-    # 更新客户端活动时间
-    client_activity[ws] = time.time()
-    
     user_data = ws.get_user_data()
-    if not user_data or "user_id" not in user_data:
-        logging.error("User data (app/user_id) not found on WebSocket message")
+    if not user_data or "chat_user_id" not in user_data:
+        logging.warning("Received message from WebSocket without user_data/chat_user_id.")
         return
 
-    user_id = user_data.get("user_id")
+    chat_user_id = user_data.get("chat_user_id")
+    app_instance = user_data.get("app")
     remote_address_str = decode_remote_address(ws)
 
-    # --- Message Type Handling ---
+    if ws in client_activity: client_activity[ws] = time.time()
+    else:
+        logging.debug(f"ws_message: Received message from user {chat_user_id} but not in activity tracker.")
+        return
+
+    logging.debug(f"ws_message: Received OpCode {opcode} from user {chat_user_id} ({remote_address_str})")
+
     message_content = None
     is_text = False
 
+    # --- Message Handling (largely unchanged, uses chat_user_id) ---
     if opcode == OpCode.TEXT:
-        # Handle text messages
         try:
-            if isinstance(message, str):
-                message_content = message
-                is_text = True
-            elif isinstance(message, bytes):
-                message_content = message.decode('utf-8', errors='replace')
-                is_text = True
-            else:
-                logging.error(f"收到来自 {user_id} 的消息类型不支持: {type(message)}")
-                return
-                
-            logging.debug(f"收到来自 {remote_address_str} ({user_id}) 的文本消息: {message_content}")
-        except Exception as e:
-            logging.error(f"解析消息内容时出错: {e}")
-            return
-    elif opcode == OpCode.BINARY:
-        logging.info(f"收到来自 {remote_address_str} ({user_id}) 的二进制消息 (长度: {len(message)})")
-        try:
-            # Try to handle binary message as UTF-8 text (for browser compatibility)
-            if isinstance(message, bytes):
-                message_content = message.decode('utf-8', errors='replace')
-                is_text = True
-                logging.debug(f"已将二进制消息解码为文本: {message_content}")
-            else:
-                logging.error(f"二进制消息类型不支持: {type(message)}")
-                return
-        except Exception as e:
-            logging.error(f"解析二进制消息时出错: {e}")
-            return
-    else:
-        # Handle control frames
-        if opcode == OpCode.PING:
-            logging.debug(f"收到来自 {user_id} 的 PING")
-            # Automatically respond to ping with pong
-            try:
-                ws.send("", OpCode.PONG)
-            except Exception as e:
-                logging.error(f"发送 PONG 响应时出错: {e}")
-        elif opcode == OpCode.PONG:
-            logging.debug(f"收到来自 {user_id} 的 PONG")
-        elif opcode == OpCode.CLOSE:
-            logging.warning(f"收到来自 {user_id} 的 CLOSE OpCode 在 ws_message 中")
-        else:
-            logging.warning(f"收到来自 {user_id} 的未知 OpCode: {opcode}")
-        return
+            if isinstance(message, bytes): message_content = message.decode("utf-8")
+            elif isinstance(message, str): message_content = message
+            else: logging.error(f"ws_message: Unexpected TEXT type {type(message)} from {chat_user_id}"); return
+            is_text = True
+            logging.debug(f"ws_message: Decoded TEXT from {chat_user_id}: {message_content}")
+        except UnicodeDecodeError: logging.error(f"ws_message: Failed UTF-8 decode from {chat_user_id}"); return
+        except Exception as e: logging.error(f"ws_message: Error processing TEXT from {chat_user_id}: {e}", exc_info=True); return
+    elif opcode == OpCode.BINARY: logging.info(f"ws_message: Received BINARY from {chat_user_id}. Length: {len(message)}"); return
+    elif opcode == OpCode.PING: logging.debug(f"ws_message: Received PING from {chat_user_id}. Relying on auto PONG."); return
+    elif opcode == OpCode.PONG: logging.debug(f"ws_message: Received PONG from {chat_user_id}."); return
+    elif opcode == OpCode.CLOSE: logging.warning(f"ws_message: Received CLOSE OpCode from {chat_user_id} in message handler."); return
+    else: logging.warning(f"ws_message: Received unknown OpCode {opcode} from {chat_user_id}."); return
 
-    # --- Process Text Message ---
+    # Process Decoded Text Message
     if is_text and message_content:
         try:
             data = json.loads(message_content)
-            
-            # 处理 ping 心跳消息
-            if data.get('type') == 'ping':
-                logging.debug(f"收到来自 {user_id} 的 ping 心跳")
-                try:
-                    # 发送 pong 响应
-                    pong_response = json.dumps({
-                        "type": "pong",
-                        "timestamp": time.time()
-                    })
-                    ws.send(pong_response, OpCode.TEXT)
-                    return
-                except Exception as e:
-                    logging.error(f"发送 pong 响应时出错: {e}")
-                    return
-            
-            # Add user ID and timestamp to the data (for normal messages)
-            data['user'] = user_id
-            if 'timestamp' not in data:
-                data['timestamp'] = time.time()
+            message_type = data.get("type")
+            data["user"] = chat_user_id # Set user field correctly
+            if "timestamp" not in data: data["timestamp"] = time.time()
 
-            # Basic validation of expected chat message format
-            if data.get('type') == 'chat' and 'message' in data:
-                app_instance = user_data.get("app")
+            if message_type == "chat" and "message" in data:
                 if app_instance:
                     try:
-                        # Publish the message to all clients in the room
                         formatted_message = json.dumps(data)
-                        app_instance.publish(DEFAULT_ROOM, formatted_message, False)
-                        logging.debug(f"广播来自 {user_id} 的聊天消息到房间 {DEFAULT_ROOM}")
-                    except Exception as pub_err:
-                        logging.error(f"广播消息时出错: {pub_err}")
-                else:
-                    logging.error(f"无法获取 app 实例来广播消息")
-            else:
-                logging.warning(f"收到来自 {user_id} 的未知或无效消息类型: {data.get('type')}")
-                
+                        logging.debug(f"ws_message: Broadcasting chat from {chat_user_id} to '{DEFAULT_ROOM}'")
+                        app_instance.publish(DEFAULT_ROOM, formatted_message, OpCode.TEXT)
+                        logging.debug(f"ws_message: Publish called for chat message.")
+                    except Exception as pub_err: logging.error(f"ws_message: Error broadcasting chat from {chat_user_id}: {pub_err}", exc_info=True)
+                else: logging.error(f"ws_message: app_instance missing for broadcast from {chat_user_id}")
+            else: logging.warning(f"ws_message: Invalid message type '{message_type}' from {chat_user_id}: {message_content}")
         except json.JSONDecodeError:
-            logging.error(f"无法解析来自 {user_id} 的 JSON 消息: {message_content}")
-            try:
-                error_msg = json.dumps({
-                    "type": "error", 
-                    "message": "无效的消息格式 (非 JSON 文本)",
-                    "timestamp": time.time()
-                })
-                ws.send(error_msg, OpCode.TEXT)
-            except Exception as send_err:
-                logging.error(f"发送错误消息失败: {send_err}")
-        except Exception as e:
-            logging.error(f"处理消息时出错: {e}")
+            logging.error(f"ws_message: Failed JSON decode from {chat_user_id}: {message_content}")
+            try: ws.send(json.dumps({"type": "error", "message": "无效消息格式", "timestamp": time.time()}), OpCode.TEXT)
+            except Exception as send_err: logging.error(f"ws_message: Failed send JSON error to {chat_user_id}: {send_err}")
+        except Exception as e: logging.error(f"ws_message: General error processing msg from {chat_user_id}: {e}", exc_info=True)
 
 
 async def ws_close(ws, code, message):
     """(Async) Handles WebSocket connection closure."""
-    # 移除客户端活动记录
-    if ws in client_activity:
-        del client_activity[ws]
-        
     user_data = ws.get_user_data()
-    user_id = "未知用户"
+    chat_user_id = "Unknown"
     app_instance = None
     remote_address_str = decode_remote_address(ws)
 
     if user_data:
-        user_id = user_data.get("user_id", "未知用户(获取失败)")
+        chat_user_id = user_data.get("chat_user_id", "Unknown(Data Error)")
         app_instance = user_data.get("app")
+
+    client_activity.pop(ws, None)
+    logging.debug(f"ws_close: Removed user {chat_user_id} from activity tracker.")
 
     message_str = ""
     if message:
         try:
-            if isinstance(message, bytes):
-                message_str = message.decode('utf-8', errors='replace')
-            elif isinstance(message, str):
-                message_str = message
-            else:
-                message_str = f"(非预期类型: {type(message)})"
-        except Exception:
-            message_str = "(无法解码的消息)"
+            if isinstance(message, bytes): message_str = message.decode("utf-8", errors="replace")
+            elif isinstance(message, str): message_str = message
+            else: message_str = f"(Unexpected type: {type(message)})"
+        except Exception: message_str = "(Undecodable close message)"
 
-    logging.info(f"客户端断开连接: {remote_address_str} (ID: {user_id}), code: {code}, message: {message_str}")
+    logging.info(f"ws_close: Client disconnected: {remote_address_str} (User ID: {chat_user_id}), Code: {code}, Message: '{message_str}'")
 
-    # Broadcast leave message if user_id is known and app_instance is available
-    if user_id != "未知用户" and user_id != "未知用户(获取失败)" and app_instance:
-        leave_message = json.dumps({
-            "type": "user_leave",
-            "user": user_id,
-            "timestamp": time.time()
-        })
+    # Broadcast leave message
+    if chat_user_id and chat_user_id not in ["Unknown", "Unknown(Data Error)", "Unknown(Pre-Data)"] and app_instance:
+        logging.debug(f"ws_close: Preparing leave broadcast for user {chat_user_id}...")
+        leave_message = json.dumps({"type": "user_leave", "user": chat_user_id, "timestamp": time.time()})
         try:
-            app_instance.publish(DEFAULT_ROOM, leave_message, False)
-            logging.info(f"已广播用户 {user_id} 离开房间 {DEFAULT_ROOM} 的消息")
-        except Exception as pub_err:
-            logging.error(f"广播用户离开消息时出错: {pub_err}")
+            app_instance.publish(DEFAULT_ROOM, leave_message, OpCode.TEXT)
+            logging.info(f"ws_close: Broadcasted leave message for user {chat_user_id} to room '{DEFAULT_ROOM}'.")
+        except Exception as pub_err: logging.error(f"ws_close: Error broadcasting leave for {chat_user_id}: {pub_err}", exc_info=True)
+    elif not app_instance: logging.warning(f"ws_close: Cannot broadcast leave for {chat_user_id}, app_instance missing.")
+    else: logging.debug(f"ws_close: Not broadcasting leave for invalid/unknown user ID '{chat_user_id}'.")
 
 
 # --- HTTP Handler (Async) ---
 async def home(res, req):
-    """(Async) Handles HTTP GET requests for the root path '/'."""
-    res.write_header('Content-Type', 'text/plain; charset=utf-8')
-    res.end("安全聊天室后端正在运行 (使用 Poetry, 随机用户 ID, WSS/HTTPS)")
+    res.write_header("Content-Type", "text/plain; charset=utf-8")
+    res.end("Secure Chat Room Backend Running (Random User IDs, WSS/HTTPS)")
 
 
 # --- Main Application Setup and Start ---
 if __name__ == "__main__":
-    # --- SSL/TLS Configuration ---
-    ssl_certfile = os.getenv('SSL_CERTFILE', 'cert.pem')
-    ssl_keyfile = os.getenv('SSL_KEYFILE', 'key.pem')
-    ssl_passphrase = os.getenv('SSL_PASSPHRASE')
+    ssl_certfile = os.getenv("SSL_CERTFILE")
+    ssl_keyfile = os.getenv("SSL_KEYFILE")
+    ssl_passphrase = os.getenv("SSL_PASSPHRASE")
     app_options = None
+    if ssl_certfile and ssl_keyfile and os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile):
+        try:
+            app_options = AppOptions(key_file_name=ssl_keyfile, cert_file_name=ssl_certfile, passphrase=ssl_passphrase)
+            logging.info(f"SSL cert/key found. Enabling HTTPS/WSS.")
+        except Exception as e: logging.error(f"Error creating AppOptions for SSL: {e}", exc_info=True)
+    else: logging.warning("SSL cert/key not found or not set. Running in HTTP/WS mode.")
 
-    if ssl_certfile and ssl_keyfile:
-        if os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile):
-            try:
-                app_options = AppOptions(
-                    key_file_name=ssl_keyfile,
-                    cert_file_name=ssl_certfile,
-                    passphrase=ssl_passphrase
-                )
-                logging.info(f"找到 SSL 证书和密钥文件，将使用 AppOptions 启用 HTTPS/WSS")
-            except Exception as e:
-                logging.error(f"创建 AppOptions 时出错: {e}")
-                app_options = None
-        else:
-            logging.warning(f"SSL 证书或密钥文件路径无效或文件不存在，将以 HTTP/WS 模式运行")
-    else:
-        logging.warning("未配置 SSL 证书和密钥环境变量，将以 HTTP/WS 模式运行")
-
-    # Create the Socketify App, passing AppOptions if available
     app = socketify.App(app_options)
-    globals()['app'] = app
+    globals()["app"] = app
 
-    # WebSocket configuration options with improved settings
     ws_options = {
-        "compression": 0,  # 禁用压缩以避免潜在问题
-        "max_payload_length": 16 * 1024,
-        "idle_timeout": 120,  # 降低超时时间以更快检测死连接
-        "max_backpressure": 1024 * 1024,  # 设置合理的背压限制
-        "reset_idle_timeout_on_send": True,  # 发送时重置超时
-        "upgrade": ws_upgrade,
-        "open": ws_open,
-        "message": ws_message,
-        "close": ws_close,
-        "ping": None,  # 让库自动处理 ping
-        "pong": None,  # 让库自动处理 pong
+        "compression": 0, "max_payload_length": 16 * 1024, "idle_timeout": 120,
+        "max_backpressure": 1 * 1024 * 1024, "max_lifetime": 0, "reset_idle_timeout_on_send": True,
+        "send_pings_automatically": True,
+        "upgrade": ws_upgrade, "open": ws_open, "message": ws_message, "close": ws_close,
     }
-
+    logging.info(f"WebSocket options configured: {ws_options}")
     app.ws("/ws", ws_options)
     app.get("/", home)
-
-    # 启动心跳检查器 (以线程方式运行，而不是使用 asyncio.create_task)
     start_heartbeat_checker()
-
-    # Get host and port from environment variables or use defaults
-    port = int(os.getenv('PORT', '8011'))
-    host = os.getenv('HOST', '0.0.0.0')
-
-    logging.info(f"服务器正在启动，监听地址 {host}:{port}...")
-
-    # Define the callback for successful listening
+    port_str = os.getenv("PORT", "8011")
+    try: port = int(port_str)
+    except ValueError: logging.error(f"Invalid PORT: '{port_str}'. Using 8011."); port = 8011
+    host = os.getenv("HOST", "0.0.0.0")
+    logging.info(f"Attempting to start server on {host}:{port}...")
     def on_listen(config):
-        protocol = 'https' if app_options else 'http'
-        ws_protocol = 'wss' if app_options else 'ws'
-        display_host = host if host != '0.0.0.0' else '127.0.0.1'
-        actual_port = config.port
+        protocol = "https" if app_options else "http"; ws_protocol = "wss" if app_options else "ws"
+        actual_host = config.host if config.host != "0.0.0.0" else "127.0.0.1"; actual_port = config.port
+        if config.host == "0.0.0.0": logging.info(f"Server listening on 0.0.0.0:{actual_port}")
+        else: logging.info(f"Server listening on {config.host}:{actual_port}")
+        logging.info(f"Successfully started!")
+        logging.info(f"  HTTP: {protocol}://{actual_host}:{actual_port}/")
+        logging.info(f"  WS:   {ws_protocol}://{actual_host}:{actual_port}/ws") # No query param needed now
+    def on_error(error): logging.error(f"Failed to listen on {host}:{port} - {error}", exc_info=True)
+    try: app.listen(port, on_listen, host=host); app.run()
+    except Exception as listen_err: on_error(listen_err)
+    logging.info("Server shutdown.")
 
-        if host == '0.0.0.0':
-            logging.info(f"服务器正在监听所有接口 (0.0.0.0) 上的端口 {actual_port}")
-            logging.info(f"请使用你机器的实际 IP 地址或 'localhost'/'127.0.0.1' 访问")
-
-        logging.info(
-            f"成功启动! "
-            f"访问 {protocol}://{display_host}:{actual_port} 或 "
-            f"{ws_protocol}://{display_host}:{actual_port}/ws"
-        )
-
-    # Start listening
-    app.listen(port, on_listen)
-
-    # Run the application's event loop
-    app.run()
