@@ -140,7 +140,7 @@ async def ws_open(ws):
             welcome_message = json.dumps(
                 {
                     "type": "system",
-                    "message": f"欢迎, 你的用户ID是: {chat_user_id}",
+                    "message": f"welcome ,your userid is : {chat_user_id}",
                     "user_id": chat_user_id,
                     "timestamp": time.time(),
                 }
